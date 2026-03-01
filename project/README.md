@@ -1,94 +1,106 @@
-# Munder Difflin Multi-Agent System Project
+# Beaver's Choice / Munder Difflin Multi-Agent Inventory and Quoting System
 
-Welcome to the starter code repository for the **Munder Difflin Paper Company Multi-Agent System Project**! This repository contains the starter code and tools you will need to design, build, and test a multi-agent system that supports core business operations at a fictional paper manufacturing company.
+## Problem Statement
+Beaver's Choice Paper Company needed a text-based multi-agent system to improve three operational bottlenecks:
+- Slow and inconsistent inventory checks
+- Delayed/uneven quote generation
+- Unreliable sales finalization due to stock and delivery constraints
 
-## Project Context
+Project constraints required:
+- Maximum of 5 agents
+- Agent orchestration using one recommended framework (`smolagents`, `pydantic-ai`, or `npcsh`)
+- End-to-end evaluation using `quote_requests_sample.csv`
+- Persisted outputs in `test_results.csv`
 
-You’ve been hired as an AI consultant by Munder Difflin Paper Company, a fictional enterprise looking to modernize their workflows. They need a smart, modular **multi-agent system** to automate:
+## Approach
+The implemented system uses **pydantic-ai** with deterministic business logic and framework-style tool definitions.
 
-- **Inventory checks** and restocking decisions
-- **Quote generation** for incoming sales inquiries
-- **Order fulfillment** including supplier logistics and transactions
+### Why this architecture
+The workflow was split into non-overlapping responsibilities so each business function is owned by one worker agent, while an orchestrator manages routing and final response assembly.
 
-Your solution must use a maximum of **5 agents** and process inputs and outputs entirely via **text-based communication**.
+### Agent design (5 total)
+1. `OrchestrationAgent`
+- Delegates work to other agents, coordinates data flow, and assembles the final response.
 
-This project challenges your ability to orchestrate agents using modern Python frameworks like `smolagents`, `pydantic-ai`, or `npcsh`, and combine that with real data tools like `sqlite3`, `pandas`, and LLM prompt engineering.
+2. `RequestParsingAgent`
+- Parses incoming text into structured fields (items, quantities, dates, metadata, unknown tokens).
 
----
+3. `InventoryAgent`
+- Checks stock, computes shortages, determines reorders, estimates supplier delivery, and logs stock-order transactions.
 
-## What’s Included
+4. `QuoteAgent`
+- Computes pricing, applies discount strategy, and uses historical quote context for adjustments.
 
-From the `project.zip` starter archive, you will find:
+5. `FulfillmentAgent`
+- Validates delivery feasibility and finalizes sales transactions if feasible.
 
-- `project_starter.py`: The main Python script you will modify to implement your agent system
-- `quotes.csv`: Historical quote data used for reference by quoting agents
-- `quote_requests.csv`: Incoming customer requests used to build quoting logic
-- `quote_requests_sample.csv`: A set of simulated test cases to evaluate your system
+## Solution Implementation
+Main implementation file: `project_starter.py`
 
----
+### Framework and API configuration
+- Framework: `pydantic-ai`
+- API routing: **Vocareum OpenAI proxy** (`https://openai.vocareum.com/v1`)
+- Key loading: `.env` via `UDACITY_OPENAI_API_KEY`
 
-## Workspace Instructions
+### Tooling and helper function usage
+All required starter helper functions are used through agent tool wrappers:
+- `create_transaction`
+- `get_all_inventory`
+- `get_stock_level`
+- `get_supplier_delivery_date`
+- `get_cash_balance`
+- `generate_financial_report`
+- `search_quote_history`
 
-All the files have been provided in the VS Code workspace on the Udacity platform. Please install the agent orchestration framework of your choice.
+### Data flow summary
+`Request` -> `Parse` -> `Inventory/Reorder` -> `Quote` -> `Fulfillment` -> `Final response`
 
-## Local setup instructions
+Supporting docs:
+- `workflow_diagram.md`
+- `design_notes.txt`
+- `reflection_report.txt`
+- `submission_checklist.md`
 
-1. Install dependencies
+## Evaluation and Results
+Evaluation used the full `quote_requests_sample.csv` request set.
 
-Make sure you have Python 3.8+ installed.
+Generated output:
+- `test_results.csv`
 
-You can install all required packages using the provided requirements.txt file:
+Observed outcomes from current run:
+- 20/20 requests processed
+- 13 cash-balance changes
+- 15 fulfilled requests (confirmed)
+- 5 unfulfilled requests with explicit timing/availability reasons
 
-`pip install -r requirements.txt`
+This demonstrates the system handles both success and constraint-driven rejection paths while maintaining financial/inventory state.
 
-If you're using smolagents, install it separately:
+## How We Did It (Execution Steps)
+1. Built a 5-agent architecture and mapped responsibilities in `workflow_diagram.md`.
+2. Implemented pydantic-ai-based agents with explicit tool definitions in `project_starter.py`.
+3. Wired all required starter helper functions through tool wrappers.
+4. Ran test scenarios using `quote_requests_sample.csv` and captured output in `test_results.csv`.
+5. Validated rubric coverage through `submission_checklist.md` and documented analysis in `reflection_report.txt`.
 
-`pip install smolagents`
+## Local Run Instructions
+From the `project` folder:
 
-For other options like pydantic-ai or npcsh[lite], refer to their documentation.
+```bash
+python3 -m pip install -r requirements.txt
+```
 
-2. Create .env File
+Create `.env`:
 
-Add your OpenAI-compatible API key:
+```env
+UDACITY_OPENAI_API_KEY=your_vocareum_key
+```
 
-`UDACITY_OPENAI_API_KEY=your_openai_key_here`
+Run:
 
-This project uses a custom OpenAI-compatible proxy hosted at https://openai.vocareum.com/v1.
+```bash
+python3 project_starter.py
+```
 
-## How to Run the Project
-
-Start by defining your agents in the `"YOUR MULTI AGENT STARTS HERE"` section inside `template.py`. Once your agent team is ready:
-
-1. Run the `run_test_scenarios()` function at the bottom of the script.
-2. This will simulate a series of customer requests.
-3. Your system should respond by coordinating inventory checks, generating quotes, and processing orders.
-
-Output will include:
-
-- Agent responses
-- Cash and inventory updates
-- Final financial report
-- A `test_results.csv` file with all interaction logs
-
----
-
-## Tips for Success
-
-- Start by sketching a **flow diagram** to visualize agent responsibilities and interactions.
-- Test individual agent tools before full orchestration.
-- Always include **dates** in customer requests when passing data between agents.
-- Ensure every quote includes **bulk discounts** and uses past data when available.
-- Use the **exact item names** from the database to avoid transaction failures.
-
----
-
-## Submission Checklist
-
-Make sure to submit the following files:
-
-1. Your completed `template.py` or `project_starter.py` with all agent logic
-2. A **workflow diagram** describing your agent architecture and data flow
-3. A `README.txt` or `design_notes.txt` explaining how your system works
-4. Outputs from your test run (like `test_results.csv`)
-
----
+Expected artifacts:
+- `test_results.csv`
+- Console logs for each request with cash/inventory updates and final report

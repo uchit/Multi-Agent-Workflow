@@ -1,0 +1,59 @@
+Reflection Report
+=================
+
+1) Agent workflow explanation and architecture decisions
+--------------------------------------------------------
+The implemented system uses a five-agent architecture:
+- OrchestrationAgent
+- RequestParsingAgent
+- InventoryAgent
+- QuoteAgent
+- FulfillmentAgent
+
+This matches the workflow diagram in `workflow_diagram.md` and was chosen to separate concerns cleanly while staying within the project limit of five agents.
+
+Decision-making process for this architecture:
+- I started from the business flow in the prompt: parse inbound request -> evaluate stock -> compute quote -> finalize sale.
+- I assigned one worker agent per core business capability (parsing, inventory, quoting, fulfillment).
+- I added a dedicated OrchestrationAgent to control delegation, sequence execution, and merge outputs into one final customer-facing response.
+- I intentionally avoided overlapping ownership so each agent has a single primary responsibility:
+  - RequestParsingAgent only structures text input and extracts metadata/dates/items.
+  - InventoryAgent alone handles stock checks, reorder decisions, and reorder transactions.
+  - QuoteAgent alone handles pricing and discounting, including historical quote context.
+  - FulfillmentAgent alone decides delivery feasibility and writes sales transactions.
+  - OrchestrationAgent routes between workers and composes the final response.
+
+Why this architecture was preferred:
+- It maps directly to required business functions and rubric categories.
+- It simplifies debugging by isolating failures to one worker domain.
+- It enables incremental improvements (for example, replacing only quote logic) without redesigning the full system.
+
+2) Evaluation results and strengths (from test_results.csv)
+-----------------------------------------------------------
+The system was evaluated on the full sample set (`quote_requests_sample.csv`, 20 requests), and results were written to `test_results.csv`.
+
+Observed outcomes from `test_results.csv`:
+- 20/20 requests were processed and logged.
+- Cash balance changed 13 times across the sequence, showing repeated successful transaction effects.
+- 15 requests were successfully fulfilled (responses include "Order confirmed").
+- 5 requests were not fulfilled, with explicit timing/availability reasons (for example, item available only after requested delivery date).
+
+System strengths demonstrated by these results:
+- End-to-end operational flow works across all requests, including stateful updates.
+- Inventory and finance state are updated consistently through transaction logging.
+- The system supports both positive-path fulfillment and realistic rejection paths when delivery constraints cannot be met.
+- Unfulfilled outcomes are explainable, which improves business transparency and trust.
+
+3) Improvements for next iteration
+----------------------------------
+1. Improve request parsing robustness and unit normalization.
+Current parsing still captures some noise tokens (for example, fragments from appended date text). A stronger parser with stricter entity extraction and validation rules would reduce skipped/unknown items and improve quote accuracy.
+
+2. Add dynamic supplier and reorder policy optimization.
+Current reorder logic uses fixed heuristics. A better approach would model lead-time and cash constraints per item/supplier, then optimize reorder quantity for service level and working capital.
+
+3. Add quote quality controls and confidence scoring.
+Introduce confidence scores for item mapping and pricing assumptions, and include a human-review trigger for low-confidence or high-value orders.
+
+4. Add richer evaluation metrics and automated regression checks.
+Beyond fulfillment count and cash changes, include metrics such as average margin, stockout frequency, late-delivery risk, and parse accuracy, then fail CI if metrics regress.

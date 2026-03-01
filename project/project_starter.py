@@ -4,10 +4,18 @@ import os
 import time
 import dotenv
 import ast
+import re
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional
 from sqlalchemy import create_engine, Engine
+
+try:
+    from pydantic_ai import Agent
+    PYDANTIC_AI_AVAILABLE = True
+except Exception:
+    Agent = None
+    PYDANTIC_AI_AVAILABLE = False
 
 # Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
@@ -588,24 +596,612 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 ########################
 
+# This project can run without external LLM APIs by using deterministic, text-driven agents.
+# Agents: parsing, inventory/reordering, quoting, fulfillment, and orchestration.
 
-# Set up and load your env parameters and instantiate your model.
-
-
-"""Set up tools for your agents to use, these should be methods that combine the database functions above
- and apply criteria to them to ensure that the flow of the system is correct."""
+dotenv.load_dotenv()
 
 
-# Tools for inventory agent
+def _configure_model_env() -> str:
+    """
+    Force Vocareum OpenAI-compatible endpoint/key wiring for pydantic-ai and
+    return the model identifier to use.
+    """
+    # Prefer Vocareum-provided key when present.
+    if os.getenv("UDACITY_OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.getenv("UDACITY_OPENAI_API_KEY")
+
+    # Always route through Vocareum proxy for this project.
+    os.environ["OPENAI_BASE_URL"] = "https://openai.vocareum.com/v1"
+
+    return os.getenv("PAPER_AGENT_MODEL", "openai:gpt-4o-mini")
 
 
-# Tools for quoting agent
+def _llm_enabled() -> bool:
+    return PYDANTIC_AI_AVAILABLE and bool(os.getenv("OPENAI_API_KEY"))
 
 
-# Tools for ordering agent
+def _safe_agent_run(agent: Optional["Agent"], prompt: str) -> str:
+    if not agent:
+        return ""
+    try:
+        result = agent.run_sync(prompt)
+        return str(getattr(result, "data", ""))
+    except Exception:
+        return ""
 
 
-# Set up your agents and create an orchestration agent that will manage them.
+_REQUEST_DATE_PATTERN = re.compile(r"Date of request:\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+_DELIVERY_DATE_PATTERN = re.compile(r"by\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})", re.IGNORECASE)
+_ITEM_PATTERN = re.compile(
+    r"(\d[\d,]*)\s*(sheets?|reams?|rolls?|boxes?|packets?|cups?|plates?|napkins?|"
+    r"flyers?|posters?|tickets?|folders?|cards?)?\s*(?:of\s+)?"
+    r"([A-Za-z0-9\-\(\)\"'/\s]+?)(?=(?:,|\.|\n|\band\b|$))",
+    re.IGNORECASE,
+)
+
+_UNIT_MULTIPLIER = {
+    "ream": 500,
+    "reams": 500,
+    "box": 100,
+    "boxes": 100,
+    "packet": 100,
+    "packets": 100,
+}
+
+_ITEM_ALIASES = {
+    "a4 paper": "A4 paper",
+    "a4 glossy paper": "Glossy paper",
+    "a3 glossy paper": "Glossy paper",
+    "a4 matte paper": "Matte paper",
+    "a3 matte paper": "Matte paper",
+    "letter paper": "Letter-sized paper",
+    "letter-sized paper": "Letter-sized paper",
+    "printer paper": "Standard copy paper",
+    "printing paper": "Standard copy paper",
+    "white printer paper": "Standard copy paper",
+    "standard printer paper": "Standard copy paper",
+    "cardstock": "Cardstock",
+    "heavy cardstock": "Cardstock",
+    "colored cardstock": "Cardstock",
+    "colored paper": "Colored paper",
+    "construction paper": "Construction paper",
+    "poster board": "Large poster paper (24x36 inches)",
+    "poster boards": "Large poster paper (24x36 inches)",
+    "poster paper": "Poster paper",
+    "streamers": "Party streamers",
+    "washi tape": "Decorative adhesive tape (washi tape)",
+    "table napkins": "Paper napkins",
+    "napkins": "Paper napkins",
+    "paper cups": "Paper cups",
+    "paper plates": "Paper plates",
+    "cups": "Paper cups",
+    "plates": "Paper plates",
+    "flyers": "Flyers",
+    "posters": "Large poster paper (24x36 inches)",
+    "envelopes": "Envelopes",
+}
+
+
+def _normalize_text(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", value.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _extract_request_date(request_text: str) -> str:
+    match = _REQUEST_DATE_PATTERN.search(request_text)
+    if match:
+        return match.group(1)
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _extract_delivery_date(request_text: str, request_date: str) -> str:
+    match = _DELIVERY_DATE_PATTERN.search(request_text)
+    if not match:
+        return (datetime.fromisoformat(request_date) + timedelta(days=7)).strftime("%Y-%m-%d")
+    try:
+        return datetime.strptime(match.group(1), "%B %d, %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return (datetime.fromisoformat(request_date) + timedelta(days=7)).strftime("%Y-%m-%d")
+
+
+def _load_price_catalog() -> Dict[str, float]:
+    inventory_df = pd.read_sql("SELECT item_name, unit_price FROM inventory", db_engine)
+    catalog = dict(zip(inventory_df["item_name"], inventory_df["unit_price"]))
+    for item in paper_supplies:
+        catalog.setdefault(item["item_name"], item["unit_price"])
+    return catalog
+
+
+def _resolve_item_name(raw_item: str, valid_items: List[str]) -> Optional[str]:
+    normalized = _normalize_text(raw_item)
+    if not normalized:
+        return None
+
+    if normalized in _ITEM_ALIASES:
+        return _ITEM_ALIASES[normalized]
+
+    for key, canonical in _ITEM_ALIASES.items():
+        if key in normalized or normalized in key:
+            return canonical
+
+    normalized_to_actual = {_normalize_text(item): item for item in valid_items}
+    if normalized in normalized_to_actual:
+        return normalized_to_actual[normalized]
+
+    best_item = None
+    best_overlap = 0
+    raw_tokens = set(normalized.split())
+    for candidate in valid_items:
+        candidate_tokens = set(_normalize_text(candidate).split())
+        overlap = len(raw_tokens.intersection(candidate_tokens))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_item = candidate
+
+    return best_item if best_overlap >= 1 else None
+
+
+class RequestParsingAgent:
+    def __init__(self, model_name: str):
+        self.valid_items = [item["item_name"] for item in paper_supplies]
+        self.tools = {
+            "extract_request_date": _extract_request_date,
+            "extract_delivery_date": _extract_delivery_date,
+        }
+        self.parser_llm = None
+        if _llm_enabled():
+            self.parser_llm = Agent(
+                model_name,
+                system_prompt=(
+                    "You are a request parsing specialist for paper inventory/quotes. "
+                    "Given a request, return one short line that states intent and any risky ambiguities."
+                ),
+            )
+
+            @self.parser_llm.tool_plain
+            def extract_request_date_tool(request_text: str) -> str:
+                return self.tools["extract_request_date"](request_text)
+
+            @self.parser_llm.tool_plain
+            def extract_delivery_date_tool(request_text: str, request_date: str) -> str:
+                return self.tools["extract_delivery_date"](request_text, request_date)
+
+    def parse(self, request_text: str) -> Dict:
+        request_date = self.tools["extract_request_date"](request_text)
+        delivery_date = self.tools["extract_delivery_date"](request_text, request_date)
+
+        job_match = re.search(r"Customer job:\s*([^;]+)", request_text, re.IGNORECASE)
+        need_size_match = re.search(r"order size:\s*([^;]+)", request_text, re.IGNORECASE)
+        event_match = re.search(r"event:\s*([^.;]+)", request_text, re.IGNORECASE)
+
+        items = []
+        unknown_items = []
+        for qty_raw, unit_raw, item_raw in _ITEM_PATTERN.findall(request_text):
+            quantity = int(qty_raw.replace(",", ""))
+            unit = (unit_raw or "").lower().strip()
+            multiplier = _UNIT_MULTIPLIER.get(unit, 1)
+            resolved = _resolve_item_name(item_raw.strip(), self.valid_items)
+            total_quantity = int(quantity * multiplier)
+
+            if not resolved:
+                unknown_items.append({"raw_item": item_raw.strip(), "quantity": total_quantity})
+                continue
+
+            items.append({"item_name": resolved, "quantity": total_quantity, "raw_item": item_raw.strip()})
+
+        deduped = {}
+        for entry in items:
+            deduped[entry["item_name"]] = deduped.get(entry["item_name"], 0) + entry["quantity"]
+
+        llm_hint = _safe_agent_run(
+            self.parser_llm,
+            f"Analyze this customer request for parsing concerns:\n{request_text}",
+        )
+
+        return {
+            "request_text": request_text,
+            "request_date": request_date,
+            "delivery_date": delivery_date,
+            "job": (job_match.group(1).strip() if job_match else "unknown"),
+            "need_size": (need_size_match.group(1).strip() if need_size_match else "unknown"),
+            "event": (event_match.group(1).strip() if event_match else "unknown"),
+            "items": [{"item_name": k, "quantity": v} for k, v in deduped.items()],
+            "unknown_items": unknown_items,
+            "is_inventory_question": "inventory" in request_text.lower() or "stock" in request_text.lower(),
+            "parser_hint": llm_hint,
+        }
+
+
+class InventoryAgent:
+    def __init__(self, model_name: str):
+        self.catalog = _load_price_catalog()
+        self.tools = {
+            "inventory_snapshot": lambda as_of_date: get_all_inventory(as_of_date),
+            "stock_level": lambda item_name, as_of_date: int(
+                get_stock_level(item_name, as_of_date)["current_stock"].iloc[0]
+            ),
+            "cash_balance": lambda as_of_date: float(get_cash_balance(as_of_date)),
+            "supplier_eta": lambda input_date_str, quantity: get_supplier_delivery_date(input_date_str, quantity),
+            "stock_order_transaction": lambda item_name, quantity, price, date: create_transaction(
+                item_name=item_name,
+                transaction_type="stock_orders",
+                quantity=quantity,
+                price=price,
+                date=date,
+            ),
+        }
+        self.inventory_llm = None
+        if _llm_enabled():
+            self.inventory_llm = Agent(
+                model_name,
+                system_prompt=(
+                    "You are an inventory operations specialist. "
+                    "Summarize stock risk and reorder implications in one concise sentence."
+                ),
+            )
+
+            @self.inventory_llm.tool_plain
+            def inventory_snapshot_tool(as_of_date: str) -> Dict[str, int]:
+                return self.tools["inventory_snapshot"](as_of_date)
+
+            @self.inventory_llm.tool_plain
+            def stock_level_tool(item_name: str, as_of_date: str) -> int:
+                return self.tools["stock_level"](item_name, as_of_date)
+
+            @self.inventory_llm.tool_plain
+            def cash_balance_tool(as_of_date: str) -> float:
+                return self.tools["cash_balance"](as_of_date)
+
+            @self.inventory_llm.tool_plain
+            def supplier_eta_tool(input_date_str: str, quantity: int) -> str:
+                return self.tools["supplier_eta"](input_date_str, quantity)
+
+            @self.inventory_llm.tool_plain
+            def stock_order_transaction_tool(item_name: str, quantity: int, price: float, date: str) -> int:
+                return self.tools["stock_order_transaction"](item_name, quantity, price, date)
+
+    def check_and_reorder(self, parsed_request: Dict) -> Dict:
+        request_date = parsed_request["request_date"]
+        cash_balance = self.tools["cash_balance"](request_date)
+        inventory_df = pd.read_sql("SELECT item_name, min_stock_level FROM inventory", db_engine)
+        min_stock = dict(zip(inventory_df["item_name"], inventory_df["min_stock_level"]))
+
+        inventory_status = []
+        reorder_actions = []
+        total_reorder_cost = 0.0
+
+        for line in parsed_request["items"]:
+            item = line["item_name"]
+            requested_qty = int(line["quantity"])
+            current_stock = self.tools["stock_level"](item, request_date)
+
+            shortage = max(0, requested_qty - current_stock)
+            reorder_qty = 0
+            reorder_eta = request_date
+
+            if shortage > 0:
+                target_buffer = max(min_stock.get(item, 100), int(requested_qty * 0.2))
+                reorder_qty = shortage + target_buffer
+                unit_price = self.catalog[item]
+                reorder_cost = reorder_qty * unit_price
+
+                if total_reorder_cost + reorder_cost > cash_balance * 0.6:
+                    affordable_qty = int(max(0, (cash_balance * 0.6 - total_reorder_cost) / max(unit_price, 0.01)))
+                    reorder_qty = max(shortage, affordable_qty)
+                    reorder_cost = reorder_qty * unit_price
+
+                if reorder_qty > 0:
+                    reorder_eta = self.tools["supplier_eta"](request_date, reorder_qty)
+                    self.tools["stock_order_transaction"](
+                        item_name=item,
+                        quantity=int(reorder_qty),
+                        price=float(reorder_cost),
+                        date=request_date,
+                    )
+                    total_reorder_cost += reorder_cost
+                    reorder_actions.append(
+                        {
+                            "item_name": item,
+                            "quantity": int(reorder_qty),
+                            "cost": float(reorder_cost),
+                            "eta": reorder_eta,
+                        }
+                    )
+
+            inventory_status.append(
+                {
+                    "item_name": item,
+                    "requested_qty": requested_qty,
+                    "stock_before": current_stock,
+                    "shortage": shortage,
+                    "available_after_reorder": current_stock + reorder_qty,
+                    "availability_date": reorder_eta if shortage > 0 else request_date,
+                }
+            )
+
+        llm_summary = _safe_agent_run(
+            self.inventory_llm,
+            f"Request date: {request_date}\nInventory status: {inventory_status}\nReorders: {reorder_actions}",
+        )
+
+        return {
+            "inventory_status": inventory_status,
+            "reorder_actions": reorder_actions,
+            "total_reorder_cost": total_reorder_cost,
+            "inventory_summary": llm_summary,
+        }
+
+    def answer_inventory_question(self, parsed_request: Dict) -> str:
+        snapshot = self.tools["inventory_snapshot"](parsed_request["request_date"])
+        if not snapshot:
+            return "Current inventory is empty."
+        top_items = sorted(snapshot.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        lines = [f"- {name}: {qty} units" for name, qty in top_items]
+        return "Current inventory snapshot (top 10):\n" + "\n".join(lines)
+
+
+class QuoteAgent:
+    def __init__(self, model_name: str):
+        self.catalog = _load_price_catalog()
+        self.tools = {
+            "quote_history_search": lambda search_terms, limit=8: search_quote_history(search_terms, limit=limit),
+        }
+        self.quote_llm = None
+        if _llm_enabled():
+            self.quote_llm = Agent(
+                model_name,
+                system_prompt=(
+                    "You are a paper quoting specialist. "
+                    "Write a concise customer-facing explanation for the final quote."
+                ),
+            )
+
+            @self.quote_llm.tool_plain
+            def quote_history_search_tool(search_terms: List[str], limit: int = 8) -> List[Dict]:
+                return self.tools["quote_history_search"](search_terms, limit=limit)
+
+    def _estimate_history_adjustment(self, parsed_request: Dict, subtotal: float) -> float:
+        terms = [parsed_request["job"], parsed_request["event"], parsed_request["need_size"]]
+        terms.extend([line["item_name"].split()[0].lower() for line in parsed_request["items"][:3]])
+        history = self.tools["quote_history_search"]([t for t in terms if t and t != "unknown"], limit=8)
+
+        if not history or subtotal <= 0:
+            return 0.0
+
+        amounts = [float(row["total_amount"]) for row in history if row.get("total_amount") is not None]
+        if not amounts:
+            return 0.0
+
+        avg_hist = float(np.mean(amounts))
+        ratio = avg_hist / subtotal
+
+        if ratio < 0.85:
+            return 0.03
+        if ratio > 1.15:
+            return -0.02
+        return 0.0
+
+    def build_quote(self, parsed_request: Dict, inventory_result: Dict) -> Dict:
+        line_items = []
+        subtotal = 0.0
+        total_units = 0
+
+        for line in parsed_request["items"]:
+            item = line["item_name"]
+            qty = int(line["quantity"])
+            unit_price = float(self.catalog.get(item, 0.1))
+            margin_multiplier = 1.25
+            quoted_unit_price = round(unit_price * margin_multiplier, 4)
+            line_total = quoted_unit_price * qty
+
+            line_items.append(
+                {
+                    "item_name": item,
+                    "quantity": qty,
+                    "unit_price": unit_price,
+                    "quoted_unit_price": quoted_unit_price,
+                    "line_total": line_total,
+                }
+            )
+            subtotal += line_total
+            total_units += qty
+
+        bulk_discount = 0.0
+        if total_units >= 8000:
+            bulk_discount = 0.12
+        elif total_units >= 3000:
+            bulk_discount = 0.08
+        elif total_units >= 1000:
+            bulk_discount = 0.05
+
+        history_adjustment = self._estimate_history_adjustment(parsed_request, subtotal)
+        final_discount = min(max(bulk_discount + history_adjustment, 0.0), 0.20)
+        discount_amount = subtotal * final_discount
+        total_amount = round(subtotal - discount_amount, 2)
+
+        if subtotal > 0:
+            factor = total_amount / subtotal
+            for line in line_items:
+                line["final_line_total"] = round(line["line_total"] * factor, 2)
+        else:
+            for line in line_items:
+                line["final_line_total"] = 0.0
+
+        summary = (
+            f"Quoted subtotal ${subtotal:.2f}; bulk/history discount {final_discount * 100:.1f}% "
+            f"-> final quote ${total_amount:.2f}."
+        )
+
+        llm_explanation = _safe_agent_run(
+            self.quote_llm,
+            (
+                f"Items: {line_items}\nSubtotal: {subtotal:.2f}\n"
+                f"Discount percent: {final_discount * 100:.2f}\nFinal total: {total_amount:.2f}\n"
+                "Write a short, clear quote explanation."
+            ),
+        )
+
+        return {
+            "line_items": line_items,
+            "subtotal": round(subtotal, 2),
+            "discount_pct": round(final_discount, 4),
+            "discount_amount": round(discount_amount, 2),
+            "total_amount": total_amount,
+            "summary": llm_explanation or summary,
+        }
+
+
+class FulfillmentAgent:
+    def __init__(self, model_name: str):
+        self.tools = {
+            "sales_transaction": lambda item_name, quantity, price, date: create_transaction(
+                item_name=item_name,
+                transaction_type="sales",
+                quantity=quantity,
+                price=price,
+                date=date,
+            ),
+        }
+        self.fulfillment_llm = None
+        if _llm_enabled():
+            self.fulfillment_llm = Agent(
+                model_name,
+                system_prompt=(
+                    "You are a fulfillment coordinator. "
+                    "Write one concise customer status message for order confirmation or delay."
+                ),
+            )
+
+            @self.fulfillment_llm.tool_plain
+            def sales_transaction_tool(item_name: str, quantity: int, price: float, date: str) -> int:
+                return self.tools["sales_transaction"](item_name, quantity, price, date)
+
+    def finalize(self, parsed_request: Dict, inventory_result: Dict, quote_result: Dict) -> Dict:
+        delivery_date = parsed_request["delivery_date"]
+        request_date = parsed_request["request_date"]
+
+        availability = {
+            row["item_name"]: row["availability_date"]
+            for row in inventory_result["inventory_status"]
+        }
+
+        can_fulfill = True
+        blockers = []
+        for line in quote_result["line_items"]:
+            item = line["item_name"]
+            available_date = availability.get(item, request_date)
+            if available_date > delivery_date:
+                can_fulfill = False
+                blockers.append(f"{item} available on {available_date}")
+
+        if not quote_result["line_items"]:
+            return {
+                "status": "no_valid_items",
+                "message": "No recognized catalog items were found in this request.",
+                "sale_total": 0.0,
+            }
+
+        if can_fulfill:
+            transaction_date = delivery_date
+            for line in quote_result["line_items"]:
+                self.tools["sales_transaction"](
+                    item_name=line["item_name"],
+                    quantity=int(line["quantity"]),
+                    price=float(line["final_line_total"]),
+                    date=transaction_date,
+                )
+            confirmed_msg = f"Order confirmed for delivery by {delivery_date}."
+            llm_message = _safe_agent_run(
+                self.fulfillment_llm,
+                f"Create customer confirmation message for delivery date {delivery_date}.",
+            )
+            return {
+                "status": "confirmed",
+                "message": llm_message or confirmed_msg,
+                "sale_total": quote_result["total_amount"],
+            }
+
+        delay_msg = "Cannot meet requested delivery date. " + "; ".join(blockers)
+        llm_delay = _safe_agent_run(
+            self.fulfillment_llm,
+            f"Create customer delay message. Details: {delay_msg}",
+        )
+        return {
+            "status": "pending_restock",
+            "message": llm_delay or delay_msg,
+            "sale_total": 0.0,
+        }
+
+
+class OrchestrationAgent:
+    def __init__(self):
+        self.model_name = _configure_model_env()
+        self.parser = RequestParsingAgent(self.model_name)
+        self.inventory_agent = InventoryAgent(self.model_name)
+        self.quote_agent = QuoteAgent(self.model_name)
+        self.fulfillment_agent = FulfillmentAgent(self.model_name)
+        self.tools = {
+            "financial_state_view": lambda as_of_date: generate_financial_report(as_of_date),
+        }
+        self.orchestrator_llm = None
+        if _llm_enabled():
+            self.orchestrator_llm = Agent(
+                self.model_name,
+                system_prompt=(
+                    "You are the lead sales operations orchestrator for a paper company. "
+                    "Return one concise final customer response that combines quote, fulfillment, "
+                    "and any reorder or unknown-item notes."
+                ),
+            )
+
+            @self.orchestrator_llm.tool_plain
+            def financial_state_view_tool(as_of_date: str) -> Dict:
+                return self.tools["financial_state_view"](as_of_date)
+
+    def handle_request(self, request_text: str) -> str:
+        parsed = self.parser.parse(request_text)
+
+        if parsed["is_inventory_question"] and not parsed["items"]:
+            return self.inventory_agent.answer_inventory_question(parsed)
+
+        inventory_result = self.inventory_agent.check_and_reorder(parsed)
+        quote_result = self.quote_agent.build_quote(parsed, inventory_result)
+        fulfillment_result = self.fulfillment_agent.finalize(parsed, inventory_result, quote_result)
+
+        reorder_note = ""
+        if inventory_result["reorder_actions"]:
+            parts = [
+                f"{r['item_name']} x{r['quantity']} (ETA {r['eta']})"
+                for r in inventory_result["reorder_actions"]
+            ]
+            reorder_note = " Reordered: " + ", ".join(parts) + "."
+
+        unknown_note = ""
+        if parsed["unknown_items"]:
+            raw_unknown = ", ".join({item["raw_item"] for item in parsed["unknown_items"]})
+            unknown_note = f" Unrecognized items skipped: {raw_unknown}."
+
+        deterministic_message = (
+            f"{quote_result['summary']} {fulfillment_result['message']}"
+            f"{reorder_note}{unknown_note}"
+        )
+        llm_message = _safe_agent_run(
+            self.orchestrator_llm,
+            (
+                f"Parsed metadata: job={parsed['job']}, event={parsed['event']}, size={parsed['need_size']}\n"
+                f"Parser hint: {parsed.get('parser_hint', '')}\n"
+                f"Inventory summary: {inventory_result.get('inventory_summary', '')}\n"
+                f"Quote summary: {quote_result['summary']}\n"
+                f"Fulfillment: {fulfillment_result['message']}\n"
+                f"Reorder note: {reorder_note}\nUnknown note: {unknown_note}\n"
+                "Compose the final customer response."
+            ),
+        )
+        return llm_message or deterministic_message
+
+    def get_financial_report(self, as_of_date: str) -> Dict:
+        return self.tools["financial_state_view"](as_of_date)
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
@@ -613,7 +1209,7 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -625,19 +1221,20 @@ def run_test_scenarios():
         print(f"FATAL: Error loading test data: {e}")
         return
 
+    system = OrchestrationAgent()
+    if _llm_enabled():
+        print(
+            f"Framework: pydantic-ai enabled ({system.model_name}) via "
+            f"{os.getenv('OPENAI_BASE_URL', 'https://openai.vocareum.com/v1')}"
+        )
+    else:
+        print("Framework: deterministic fallback (set OPENAI_API_KEY or UDACITY_OPENAI_API_KEY to enable pydantic-ai)")
+
     # Get initial state
     initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
-    report = generate_financial_report(initial_date)
+    report = system.get_financial_report(initial_date)
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
-
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -652,18 +1249,14 @@ def run_test_scenarios():
         # Process request
         request_with_date = f"{row['request']} (Date of request: {request_date})"
 
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        # response = call_your_multi_agent_system(request_with_date)
+        request_with_context = (
+            f"Customer job: {row['job']}; order size: {row['need_size']}; event: {row['event']}. "
+            f"Request: {request_with_date}"
+        )
+        response = system.handle_request(request_with_context)
 
         # Update state
-        report = generate_financial_report(request_date)
+        report = system.get_financial_report(request_date)
         current_cash = report["cash_balance"]
         current_inventory = report["inventory_value"]
 
@@ -685,7 +1278,7 @@ def run_test_scenarios():
 
     # Final report
     final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
-    final_report = generate_financial_report(final_date)
+    final_report = system.get_financial_report(final_date)
     print("\n===== FINAL FINANCIAL REPORT =====")
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
     print(f"Final Inventory: ${final_report['inventory_value']:.2f}")

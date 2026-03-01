@@ -1,0 +1,58 @@
+Multi-Agent Design Notes
+========================
+
+Framework choice
+- Primary orchestration framework: pydantic-ai.
+- Each of the 5 agents is represented by a Python agent class with an attached pydantic-ai `Agent` for reasoning/response composition.
+- Deterministic fallback logic remains active if no API key/model access is available, so test scenarios can still execute.
+
+Agent responsibilities (explicit, non-overlapping)
+1. RequestParsingAgent
+- Extracts request date, requested delivery date, item quantities, and metadata (job/order_size/event).
+- Resolves noisy item names to catalog names with alias and token-overlap matching.
+- Flags unknown items safely.
+- Does not perform stock checks, pricing, or fulfillment decisions.
+
+2. InventoryAgent
+- Checks stock as-of request date.
+- Automatically reorders shortages with buffer stock while controlling spend against available cash.
+- Uses supplier lead-time logic to estimate ETA.
+- Can answer pure inventory/stock questions.
+- Does not compute quotes or confirm customer sales.
+
+3. QuoteAgent
+- Builds line-item prices from catalog unit costs with margin.
+- Applies bulk discount tiers by order volume.
+- Uses historical quote search (job/event/order context + item hints) for adjustment.
+- Does not modify inventory or write sales transactions.
+
+4. FulfillmentAgent
+- Confirms if all quoted items can be delivered by requested date.
+- Creates sales transactions only when delivery is feasible.
+- Marks order pending if lead-time conflicts with requested delivery.
+- Does not parse requests or calculate quote totals.
+
+5. OrchestrationAgent
+- Controls sequence and routing between agents.
+- Aggregates outputs into one final customer response.
+- Does not duplicate parsing, pricing, or inventory logic.
+
+Orchestration logic and data flow
+- `OrchestrationAgent` sends raw text to `RequestParsingAgent` and receives structured `ParsedRequest`.
+- `ParsedRequest` is sent to `InventoryAgent` to obtain shortages, reorder actions, and availability dates.
+- `ParsedRequest` + `InventoryResult` are sent to `QuoteAgent` to produce final quote totals.
+- `ParsedRequest` + `InventoryResult` + `QuoteResult` are sent to `FulfillmentAgent` for final feasibility and transaction posting.
+- `OrchestrationAgent` combines all outputs into the customer response and logs downstream state changes via existing report functions.
+
+Pricing strategy
+- Base quote = cost-plus pricing (unit_cost * 1.25).
+- Bulk discount tiers by total units: >=1000 units 5%, >=3000 units 8%, >=8000 units 12%.
+- Historical adjustment from similar quote outcomes nudges discount up/down.
+
+State updates
+- Every reorder and sale is persisted via `create_transaction`.
+- Financial position and inventory valuation update through existing report functions.
+
+Known limitations
+- Some free-text product names in requests may not map perfectly to catalog items.
+- Unit conversion for terms like "box" and "packet" uses fixed heuristics.
